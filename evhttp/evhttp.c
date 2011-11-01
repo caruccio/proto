@@ -49,8 +49,8 @@ http://software.schmorp.de/pkg/libev.html
 #include <err.h>
 #include <stddef.h>
 #include <ctype.h>
+#include <time.h>
 #include <ev.h>
-
 
 ev_io ev_accept;
 static int SERVER_PORT = 3077;
@@ -58,6 +58,8 @@ static const uint32_t EOH = 0x0a0d0a0d; //\r\n\r\n
 static const char response_header_fmt[] = "%s %u %s\r\nContent-Length: %i\r\nConnection: close\r\nContent-Type: %s\r\n\r\n";
 static const char HTTP10[] = "HTTP/1.0";
 //static uint64_t count = 0;
+
+typedef enum { READ, WRITE, READ_BE, WRITE_BE } TIMER;
 
 typedef void (*event_cb)(struct ev_loop *, struct ev_io *, int);
 
@@ -79,11 +81,14 @@ struct header_handler {
 };
 
 struct client {
-	int fd;
-	ev_io ev_write;
 	ev_io ev_read;
+	ev_io ev_write;
+	int fd;
+	int fd_be;
+	int status;
 	struct header_handler req;
 	struct header_handler res;
+	struct timespec times[4];
 };
 
 struct client* new_client(int fd)
@@ -91,6 +96,8 @@ struct client* new_client(int fd)
 	struct client *cli = calloc(1, sizeof(*cli));
 
 	cli->fd = fd;
+	cli->fd_be = -1;
+	cli->status = 0;
 
 	cli->req.buffer[sizeof(cli->req.buffer) - 1] = 0;
 	cli->req.len = 0;
@@ -112,13 +119,23 @@ struct client* new_client(int fd)
 	cli->res.content = NULL;
 	cli->res.content_len = 0;
 
+	memset(&cli->times, 0, sizeof(cli->times));
+
 	return cli;
 }
 
 void delete_client(struct client *cli)
 {
 	close(cli->fd);
+	if (cli->fd_be != -1)
+		close(cli->fd_be);
 	free(cli);
+	printf("- %lu.%09lu %lu.%09lu\n", cli->times[READ].tv_sec, cli->times[READ].tv_nsec, cli->times[WRITE].tv_sec, cli->times[WRITE].tv_nsec);
+}
+
+static void mark_time(struct client *cli, TIMER which)
+{
+	clock_gettime(CLOCK_MONOTONIC, &cli->times[which]);
 }
 
 /*
@@ -128,12 +145,13 @@ void delete_client(struct client *cli)
 static void write_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 {
 	struct client *cli = ((struct client*) (((char*)w) - offsetof(struct client, ev_write)));
+	mark_time(cli, WRITE);
 
 	if (revents & EV_WRITE) {
 		#define HELLO "Hello World!"
 		cli->res.content_len = sizeof(HELLO) - 1;
 		cli->res.header_len = snprintf(cli->res.header, sizeof(cli->res.buffer), response_header_fmt,
-												 cli->res.version, 200, "OK", cli->res.content_len, "text/plain");
+												 cli->res.version, cli->status, "OK", cli->res.content_len, "text/plain");
 		cli->res.header[cli->res.header_len] = '\0';
 		//printf("res [%s]", cli->res.header);
 	//	if (++count % 100 == 0)
@@ -294,39 +312,54 @@ static REQUEST_STATUS parse_request_header(struct header_handler *req)
 	return request_complete(req) ? REQUEST_COMPLETE : REQUEST_INCOMPLETE;
 }
 
-static void read_cb(struct ev_loop *loop, struct ev_io *w, int revents)
+static void read_be_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 {
 	struct client *cli= ((struct client*) (((char*)w) - offsetof(struct client, ev_read)));
-	event_cb cb = write_cb;
+	mark_time(cli, READ_BE);
+	char dns_buffer[4096];
+	int ret = recv(cli->fd_be, dns_buffer, sizeof(dns_buffer), 0);
 
-	if (revents & EV_READ) {
-		int ret = read(cli->fd, cli->req.buffer, sizeof(cli->req.buffer) - cli->req.len - 1);
-
-		if (ret > 0) {
-			cli->req.len += ret;
-			switch (parse_request_header(&cli->req)) {
-				case REQUEST_HEADER_COMPLETE:
-				case REQUEST_INCOMPLETE:
-					return;
-
-				case REQUEST_COMPLETE:
-					ev_io_stop(EV_A_ w);
-					ev_io_init(&cli->ev_write, cb, cli->fd, EV_WRITE);
-					ev_io_start(loop, &cli->ev_write);
-					return;
-
-				case REQUEST_INVALID:
-				default:
-					ev_io_stop(EV_A_ w);
-					delete_client(cli);
-					return;
-			}
-		} else {
-			delete_client(cli);
-		}
+	if (ret <= 0) {
+		ev_io_stop(EV_A_ w);
+		delete_client(cli);
+		return;
 	}
 
+//	printf("recv: %i\n", ret);
+	if (ret > 0)
+		cli->status = 200;
+	else
+		cli->status = 404;
 	ev_io_stop(EV_A_ w);
+	ev_io_init(&cli->ev_write, write_cb, cli->fd, EV_WRITE);
+	ev_io_start(loop, &cli->ev_write);
+}
+
+
+static void write_be_cb(struct ev_loop *loop, struct ev_io *w, int revents)
+{
+	struct client *cli = ((struct client*) (((char*)w) - offsetof(struct client, ev_write)));
+	mark_time(cli, WRITE_BE);
+	struct sockaddr_in in;
+	in.sin_family = AF_INET;
+	in.sin_port = htons(53);
+	inet_aton("10.225.0.17", &in.sin_addr);
+	char dns_buffer[] = { 0x53, 0x3a, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+								 0x00, 0x00, 0x00, 0x00, 0x05, 0x74, 0x65, 0x72,
+								 0x72, 0x61, 0x03, 0x63, 0x6f, 0x6d, 0x02, 0x62,
+								 0x72, 0x00, 0x00, 0x01, 0x00, 0x01
+	};
+
+	if (sendto(cli->fd_be, dns_buffer, sizeof(dns_buffer), 0, (struct sockaddr *)&in, sizeof(in)) == -1) {
+		cli->status = 500;
+		ev_io_stop(EV_A_ w);
+		ev_io_init(&cli->ev_write, write_cb, cli->fd, EV_WRITE);
+		ev_io_start(loop, &cli->ev_write);
+	} else {
+		ev_io_stop(EV_A_ w);
+		ev_io_init(&cli->ev_read, read_be_cb, cli->fd_be, EV_READ);
+		ev_io_start(loop, &cli->ev_read);
+	}
 }
 
 static int setnonblock(int fd)
@@ -343,10 +376,63 @@ static int setnonblock(int fd)
 	return 0;
 }
 
+
+static int start_backend(struct client *cli)
+{
+	cli->fd_be = socket(AF_INET, SOCK_DGRAM, 0);
+	if (cli->fd_be == -1)
+		return -1;
+
+	if (setnonblock(cli->fd_be) < 0)
+		return -1;
+
+	return 0;
+}
+
+static void read_cb(struct ev_loop *loop, struct ev_io *w, int revents)
+{
+	struct client *cli= ((struct client*) (((char*)w) - offsetof(struct client, ev_read)));
+
+	if (revents & EV_READ) {
+		int ret = read(cli->fd, cli->req.buffer, sizeof(cli->req.buffer) - cli->req.len - 1);
+
+		if (ret > 0) {
+			cli->req.len += ret;
+			switch (parse_request_header(&cli->req)) {
+				case REQUEST_HEADER_COMPLETE:
+				case REQUEST_INCOMPLETE:
+					return;
+
+				case REQUEST_COMPLETE:
+					ev_io_stop(EV_A_ w);
+					if (start_backend(cli) == 0) {
+						ev_io_init(&cli->ev_write, write_be_cb, cli->fd_be, EV_WRITE);
+						ev_io_start(loop, &cli->ev_write);
+					} else {
+						cli->status = 500;
+						ev_io_init(&cli->ev_write, write_cb, cli->fd, EV_WRITE);
+						ev_io_start(loop, &cli->ev_write);
+					}
+					return;
+
+				case REQUEST_INVALID:
+				default:
+					ev_io_stop(EV_A_ w);
+					delete_client(cli);
+					return;
+			}
+		} else {
+			delete_client(cli);
+		}
+	}
+
+	ev_io_stop(EV_A_ w);
+}
+
 static void accept_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 {
 	int client_fd;
-	struct client *client;
+	struct client *cli;
 	struct sockaddr_in client_addr;
 	socklen_t client_len = sizeof(client_addr);
 	client_fd = accept(w->fd, (struct sockaddr *)&client_addr, &client_len);
@@ -355,14 +441,15 @@ static void accept_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 		return;
 	}
 
-	client = new_client(client_fd);
+	cli = new_client(client_fd);
+	mark_time(cli, READ);
 
-	if (setnonblock(client->fd) < 0)
+	if (setnonblock(cli->fd) < 0)
 		err(1, "failed to set client socket to non-blocking");
 
 //	ev_io_stop(EV_A_ w);
-	ev_io_init(&client->ev_read, read_cb, client->fd, EV_READ);
-	ev_io_start(loop, &client->ev_read);
+	ev_io_init(&cli->ev_read, read_cb, cli->fd, EV_READ);
+	ev_io_start(loop, &cli->ev_read);
 }
 
 int main()
@@ -394,7 +481,7 @@ int main()
 
 	ev_io_init(&ev_accept, accept_cb, listen_fd, EV_READ);
 	ev_io_start(loop, &ev_accept);
-	printf("start\n");
+	printf("start :%s:%hi\n", inet_ntoa(listen_addr.sin_addr), SERVER_PORT);
 	ev_loop (loop, 0);
 	printf("exit\n");
 

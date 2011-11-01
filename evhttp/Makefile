@@ -1,5 +1,5 @@
 CPPFLAGS += -I/usr/include/libev
-LDFLAGS += -lev
+LDFLAGS += -lev -lrt
 APP = evhttp
 EXT = c
 
