@@ -1,15 +1,16 @@
+#APP = appname
 CFLAGS += -ggdb3 -O0 -Wall -Werror
 CPPFLAGS +=
 LDFLAGS +=
-CC = gcc
+CC ?= gcc
+EXT ?= c
 RUN = ./$(APP) $(OPT) $(OPTS) $(PARM) $(PARMS)
-#APP = evhttp
-#EXT = c
+OBJS = $(SRCS:.$(EXT)=.o)
 
 all: $(APP)
 
-$(APP): $(APP).$(EXT)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $(APP) $(APP).$(EXT) $(LDFLAGS)
+$(APP): $(OBJS)
+	$(CC) $(CFLAGS) -o $(APP) $(OBJS) $(LDFLAGS)
 
 run: $(APP)
 	$(RUN)
@@ -17,6 +18,9 @@ run: $(APP)
 gdb: $(APP)
 	gdb --args $(RUN)
 
+strace: $(APP)
+	strace $(SOPT) $(SOPTS) $(SPARM) $(SPARMS) $(RUN)
+
 clean:
-	rm -f $(APP)
+	rm -f $(APP) $(OBJS)
 

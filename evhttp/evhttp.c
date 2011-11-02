@@ -30,11 +30,6 @@ You need to have Libev installed:
 http://software.schmorp.de/pkg/libev.html
 */
 
-
-//
-// gcc -Wall -Werror -o lighttz lighttz.c -ggdb3 -O0 -lev -I /usr/include/libev && ./lighttz
-//
-
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -49,94 +44,16 @@ http://software.schmorp.de/pkg/libev.html
 #include <err.h>
 #include <stddef.h>
 #include <ctype.h>
-#include <time.h>
+#include <inttypes.h>
 #include <ev.h>
+#include <alloca.h>
+#include "client.h"
+#include "timer.h"
+#include "http_parser.h"
 
 ev_io ev_accept;
 static int SERVER_PORT = 3077;
-static const uint32_t EOH = 0x0a0d0a0d; //\r\n\r\n
-static const char response_header_fmt[] = "%s %u %s\r\nContent-Length: %i\r\nConnection: close\r\nContent-Type: %s\r\n\r\n";
-static const char HTTP10[] = "HTTP/1.0";
 //static uint64_t count = 0;
-
-typedef enum { READ, WRITE, READ_BE, WRITE_BE } TIMER;
-
-typedef void (*event_cb)(struct ev_loop *, struct ev_io *, int);
-
-/*
- * Client
- */
-
-struct header_handler {
-	char buffer[4096];
-	size_t len;
-	//manipulamos apenas os ponteiros para os dados
-	char *method;
-	char *uri;
-	const char *version;
-	char *header;
-	int header_len;
-	char *content;
-	int content_len;
-};
-
-struct client {
-	ev_io ev_read;
-	ev_io ev_write;
-	int fd;
-	int fd_be;
-	int status;
-	struct header_handler req;
-	struct header_handler res;
-	struct timespec times[4];
-};
-
-struct client* new_client(int fd)
-{
-	struct client *cli = calloc(1, sizeof(*cli));
-
-	cli->fd = fd;
-	cli->fd_be = -1;
-	cli->status = 0;
-
-	cli->req.buffer[sizeof(cli->req.buffer) - 1] = 0;
-	cli->req.len = 0;
-	cli->req.method = cli->req.buffer;
-	cli->req.uri = NULL;
-	cli->req.version = NULL;
-	cli->req.header = NULL;
-	cli->req.header_len = -1;
-	cli->req.content = NULL;
-	cli->req.content_len = 0;
-
-	cli->res.buffer[sizeof(cli->res.buffer) - 1] = 0;
-	cli->res.len = 0;
-	cli->res.method = NULL; //nao aplicavel
-	cli->res.uri = NULL; //nao aplicavel
-	cli->res.version = HTTP10;
-	cli->res.header = cli->res.buffer;
-	cli->res.header_len = -1;
-	cli->res.content = NULL;
-	cli->res.content_len = 0;
-
-	memset(&cli->times, 0, sizeof(cli->times));
-
-	return cli;
-}
-
-void delete_client(struct client *cli)
-{
-	close(cli->fd);
-	if (cli->fd_be != -1)
-		close(cli->fd_be);
-	free(cli);
-	printf("- %lu.%09lu %lu.%09lu\n", cli->times[READ].tv_sec, cli->times[READ].tv_nsec, cli->times[WRITE].tv_sec, cli->times[WRITE].tv_nsec);
-}
-
-static void mark_time(struct client *cli, TIMER which)
-{
-	clock_gettime(CLOCK_MONOTONIC, &cli->times[which]);
-}
 
 /*
  * Callbacks
@@ -150,14 +67,16 @@ static void write_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 	if (revents & EV_WRITE) {
 		#define HELLO "Hello World!"
 		cli->res.content_len = sizeof(HELLO) - 1;
-		cli->res.header_len = snprintf(cli->res.header, sizeof(cli->res.buffer), response_header_fmt,
+		cli->res.header_len = snprintf(cli->res.header, sizeof(cli->res.header), response_header_fmt,
 												 cli->res.version, cli->status, "OK", cli->res.content_len, "text/plain");
 		cli->res.header[cli->res.header_len] = '\0';
-		//printf("res [%s]", cli->res.header);
+
 	//	if (++count % 100 == 0)
 	//		printf("res [%llu]\n", count);
-		cli->res.content = cli->res.header + cli->res.header_len;
-		strncat(cli->res.content, HELLO, cli->res.content_len); //TODO: overflow
+
+		cli->res.content = alloca(cli->res.content_len);
+		cli->res.content[0] = '\0';
+		strncat(cli->res.content, HELLO, cli->res.content_len); //TODO: overflow or segv (man alloca)
 
 		struct iovec /*{
 			void  *iov_base;    // Starting address
@@ -174,147 +93,10 @@ static void write_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 	//TODO: controle de buffer
 }
 
-typedef enum {
-	REQUEST_INVALID         = 0, //nada recebido OU cabecalhos incompletos
-	REQUEST_HEADER_COMPLETE,     //todos os cabecalhos recebidos E validos
-	REQUEST_INCOMPLETE,          //cabechalos OU dados ainda faltando
-	REQUEST_COMPLETE,            //todos os cabecalhos E dados recebidos E validos
-} REQUEST_STATUS;
-
-static int request_complete_header(struct header_handler *req)
-{
-	return req->method && req->uri && req->version && req->header_len > -1;
-}
-
-static int request_parse_method(struct header_handler *req)
-{
-	if (req->header == NULL) {
-		int i = 0;
-		//procura pelo primeiro cabecalho, depois da primeira linha
-		for (i = 0; i < req->len; ++i) {
-			if (req->buffer[i] == '\r' && req->buffer[i + 1] == '\n') {
-				req->header = req->buffer + i + 2;
-					if (req->header[0] == '\r' && req->header[1] == '\n') {
-						req->header_len = req->len;
-					}
-				break;
-			}
-		}
-	}
-
-	if (req->header > req->method) {
-		unsigned int mlen = 0;
-
-		// metodo
-		char *c = req->buffer;
-		while (isspace(*c) && c < req->header)
-			++c;
-		req->method = c;
-		if (req->method[0] == 'G' && req->method[1] == 'E' && req->method[2] == 'T' && isspace(req->method[3])) {
-			mlen = 3;
-		} else {
-			printf("ret=-1\n");
-			return -1;
-		}
-		req->method[mlen] = '\0';
-
-		// uri
-		c = req->method + mlen + 1;
-		while (isspace(*c) && c < req->header)
-			++c;
-		if (c != req->header)
-			req->uri = c;
-		while ((!isspace(*c)) && c < req->header)
-			++c;
-		if (isspace(*c))
-			*c++ = '\0';
-
-		// versao
-		while (isspace(*c) && c < req->header)
-			++c;
-		if (c != req->header)
-			req->version = c;
-		while ((!isspace(*c)) && c < req->header)
-			++c;
-//		if (isspace(*c))
-//			*c = '\0';
-
-		//printf("ret=1 [%s] %s [%s]\n", req->method, req->uri, req->version);
-		return 1;
-	}
-
-	printf("ret=0\n");
-	return 0;
-}
-
-static int request_parse_headers(struct header_handler *req)
-{
-	if (req->header_len == 0)
-		return 1;
-
-	if (req->len > 3 ) {
-		//grande chance do cabecalho inteiro ja ter sido recebido e ser a unica coisa enviada (GET/DELETE)
-		uint32_t *eoh = (uint32_t *)(req->buffer + req->len - sizeof(EOH));
-		if (*eoh == EOH) {
-			req->header_len = req->len;
-			return 1;
-		}
-
-		//procura por "\r\n\r\n" a partir do inicio dos cabecalhos
-		int i = 0;
-		eoh = (uint32_t *)req->header;
-		for (i = 0; i < (req->len - (req->header - req->buffer)) ; ++i) {
-			if (*eoh == EOH) {
-				req->header_len = (req->buffer + req->len - 4) - req->header;
-				return 1;
-			}
-			eoh = (uint32_t *)(req->header + i);
-		}
-
-		return -1;
-	}
-
-	return 0;
-}
-
-static int request_complete_content(struct header_handler *req)
-{
-	if (req->content_len == 0) {
-		return 1;
-	} else if (req->content_len == -1) {
-		return 0;
-	}
-
-	return req->len > 0 && //recebi algo
-			 req->header_len > 0 &&  //tenho algum header
-			 req->content_len == (req->len - req->header_len); //ja tenho todo o content
-}
-
-static int request_complete(struct header_handler *req)
-{
-	return request_complete_header(req) && request_complete_content(req);
-}
-
-static REQUEST_STATUS parse_request_header(struct header_handler *req)
-{
-	int ret = -1;
-
-	if ((ret = request_parse_method(req)) == -1) {
-		return REQUEST_INVALID;
-	} else if (ret == 0) {
-		return REQUEST_INCOMPLETE;
-	}
-
-	if ((ret = request_parse_headers(req)) == -1) {
-		return REQUEST_INVALID;
-	}
-
-	return request_complete(req) ? REQUEST_COMPLETE : REQUEST_INCOMPLETE;
-}
-
 static void read_be_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 {
-	struct client *cli= ((struct client*) (((char*)w) - offsetof(struct client, ev_read)));
+	struct client *cli = ((struct client*) (((char*)w) - offsetof(struct client, ev_read)));
+	ev_timer_stop(EV_A_ &cli->ev_tout);
 	mark_time(cli, READ_BE);
 	char dns_buffer[4096];
 	int ret = recv(cli->fd_be, dns_buffer, sizeof(dns_buffer), 0);
@@ -326,39 +108,46 @@ static void read_be_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 	}
 
 //	printf("recv: %i\n", ret);
-	if (ret > 0)
+	if (ret > 0) {
 		cli->status = 200;
-	else
+	} else {
 		cli->status = 404;
+	}
+
 	ev_io_stop(EV_A_ w);
 	ev_io_init(&cli->ev_write, write_cb, cli->fd, EV_WRITE);
 	ev_io_start(loop, &cli->ev_write);
 }
 
-
-static void write_be_cb(struct ev_loop *loop, struct ev_io *w, int revents)
+static int send_be(struct client* cli)
 {
-	struct client *cli = ((struct client*) (((char*)w) - offsetof(struct client, ev_write)));
 	mark_time(cli, WRITE_BE);
 	struct sockaddr_in in;
 	in.sin_family = AF_INET;
 	in.sin_port = htons(53);
-	inet_aton("10.225.0.17", &in.sin_addr);
+	inet_aton("8.8.8.8", &in.sin_addr);
 	char dns_buffer[] = { 0x53, 0x3a, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
 								 0x00, 0x00, 0x00, 0x00, 0x05, 0x74, 0x65, 0x72,
 								 0x72, 0x61, 0x03, 0x63, 0x6f, 0x6d, 0x02, 0x62,
 								 0x72, 0x00, 0x00, 0x01, 0x00, 0x01
 	};
 
-	if (sendto(cli->fd_be, dns_buffer, sizeof(dns_buffer), 0, (struct sockaddr *)&in, sizeof(in)) == -1) {
-		cli->status = 500;
-		ev_io_stop(EV_A_ w);
-		ev_io_init(&cli->ev_write, write_cb, cli->fd, EV_WRITE);
-		ev_io_start(loop, &cli->ev_write);
-	} else {
-		ev_io_stop(EV_A_ w);
+	const int ret = sendto(cli->fd_be, dns_buffer, sizeof(dns_buffer), 0, (struct sockaddr *)&in, sizeof(in));
+	return ret == sizeof(dns_buffer) ? 0 : -1;
+}
+
+static void write_be_cb(struct ev_loop *loop, struct ev_io *w, int revents)
+{
+	struct client *cli = ((struct client*) (((char*)w) - offsetof(struct client, ev_write)));
+
+	ev_io_stop(EV_A_ w);
+	if (send_be(cli) == 0) {
 		ev_io_init(&cli->ev_read, read_be_cb, cli->fd_be, EV_READ);
 		ev_io_start(loop, &cli->ev_read);
+	} else {
+		cli->status = 500;
+		ev_io_init(&cli->ev_write, write_cb, cli->fd, EV_WRITE);
+		ev_io_start(loop, &cli->ev_write);
 	}
 }
 
@@ -376,7 +165,6 @@ static int setnonblock(int fd)
 	return 0;
 }
 
-
 static int start_backend(struct client *cli)
 {
 	cli->fd_be = socket(AF_INET, SOCK_DGRAM, 0);
@@ -386,47 +174,108 @@ static int start_backend(struct client *cli)
 	if (setnonblock(cli->fd_be) < 0)
 		return -1;
 
+	return 1;
+}
+
+static int on_message_begin_cb(http_parser* parser)
+{
+	//printf("%s\n", __FUNCTION__);
+	return 0;
+}
+
+static int on_url_cb(http_parser* parser, const char *at, size_t length)
+{
+//	printf("%s %s [%s] %zu.\n", __FUNCTION__, http_method_str(parser->method), at, length);
+	return 0;
+}
+
+static int on_header_field_cb(http_parser* parser, const char *at, size_t length)
+{
+//	printf("%s HTTP/%hu.%hu [%s] %zu.\n", __FUNCTION__, parser->http_major, parser->http_minor, at, length);
+	return 0;
+}
+
+static int on_header_value_cb(http_parser* parser, const char *at, size_t length)
+{
+//	printf("%s [%s] %zu.\n", __FUNCTION__, at, length);
+	return 0;
+}
+
+static int on_headers_complete_cb(http_parser* parser)
+{
+//	printf("%s\n", __FUNCTION__);
+	return 0;
+}
+
+static int on_body_cb(http_parser* parser, const char *at, size_t length)
+{
+//	printf("%s [%s] %zu.\n", __FUNCTION__, at, length);
+	return 0;
+}
+
+static int on_message_complete_cb(http_parser* parser)
+{
+//	printf("%s\n", __FUNCTION__);
 	return 0;
 }
 
 static void read_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 {
-	struct client *cli= ((struct client*) (((char*)w) - offsetof(struct client, ev_read)));
+	struct client *cli = ((struct client*) (((char*)w) - offsetof(struct client, ev_read)));
+	const int ret = read(cli->fd, cli->req.buffer, sizeof(cli->req.buffer) - cli->req.len - 1);
 
-	if (revents & EV_READ) {
-		int ret = read(cli->fd, cli->req.buffer, sizeof(cli->req.buffer) - cli->req.len - 1);
-
-		if (ret > 0) {
-			cli->req.len += ret;
-			switch (parse_request_header(&cli->req)) {
-				case REQUEST_HEADER_COMPLETE:
-				case REQUEST_INCOMPLETE:
-					return;
-
-				case REQUEST_COMPLETE:
-					ev_io_stop(EV_A_ w);
-					if (start_backend(cli) == 0) {
-						ev_io_init(&cli->ev_write, write_be_cb, cli->fd_be, EV_WRITE);
-						ev_io_start(loop, &cli->ev_write);
-					} else {
-						cli->status = 500;
-						ev_io_init(&cli->ev_write, write_cb, cli->fd, EV_WRITE);
-						ev_io_start(loop, &cli->ev_write);
-					}
-					return;
-
-				case REQUEST_INVALID:
-				default:
-					ev_io_stop(EV_A_ w);
-					delete_client(cli);
-					return;
-			}
-		} else {
-			delete_client(cli);
-		}
+	if (ret < 1) {
+		goto err_500;
 	}
 
+	cli->settings.on_message_begin = on_message_begin_cb;
+	cli->settings.on_url = on_url_cb;
+	cli->settings.on_header_field = on_header_field_cb;
+	cli->settings.on_header_value = on_header_value_cb;
+	cli->settings.on_headers_complete = on_headers_complete_cb;
+	cli->settings.on_body = on_body_cb;
+	cli->settings.on_message_complete = on_message_complete_cb;
+	http_parser_init(&cli->parser, HTTP_REQUEST);
+
+	if (http_parser_execute(&cli->parser, &cli->settings, cli->req.buffer, ret) != ret) {
+		goto err_500;
+	}
+
+	switch (start_backend(cli)) {
+		case 0:
+			ev_io_stop(EV_A_ w);
+			ev_io_init(&cli->ev_write, write_be_cb, cli->fd_be, EV_WRITE);
+			ev_io_start(loop, &cli->ev_write);
+			return;
+		case 1:
+			ev_io_stop(EV_A_ w);
+			if (send_be(cli) == 0) {
+				ev_io_init(&cli->ev_read, read_be_cb, cli->fd_be, EV_READ);
+				ev_io_start(loop, &cli->ev_read);
+			} else {
+				cli->status = 500;
+				ev_io_init(&cli->ev_write, write_cb, cli->fd, EV_WRITE);
+				ev_io_start(loop, &cli->ev_write);
+			}
+			return;
+		default:
+			break;
+	}
+
+err_500:
+	cli->status = 500;
 	ev_io_stop(EV_A_ w);
+	ev_io_init(&cli->ev_write, write_cb, cli->fd, EV_WRITE);
+	ev_io_start(loop, &cli->ev_write);
+}
+
+static void tout_cb(EV_P_ ev_timer *w, int revents)
+{
+	struct client *cli = ((struct client*) (((char*)w) - offsetof(struct client, ev_tout)));
+	ev_timer_stop(EV_A_ w);
+	cli->status = 503;
+	ev_io_init(&cli->ev_write, write_cb, cli->fd, EV_WRITE);
+	ev_io_start(loop, &cli->ev_write);
 }
 
 static void accept_cb(struct ev_loop *loop, struct ev_io *w, int revents)
@@ -447,7 +296,9 @@ static void accept_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 	if (setnonblock(cli->fd) < 0)
 		err(1, "failed to set client socket to non-blocking");
 
-//	ev_io_stop(EV_A_ w);
+	ev_timer_init(&cli->ev_tout, tout_cb, 5.0, 0.0);
+	ev_timer_start(loop, &cli->ev_tout);
+
 	ev_io_init(&cli->ev_read, read_cb, cli->fd, EV_READ);
 	ev_io_start(loop, &cli->ev_read);
 }
