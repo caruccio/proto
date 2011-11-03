@@ -15,7 +15,7 @@ int be_dns_start(struct client *cli)
 	if (setnonblock(cli->fd_be) < 0)
 		return -1;
 
-	return 1;
+	return 0;
 }
 
 void be_dns_read_cb(struct ev_loop *loop, struct ev_io *w, int revents)
@@ -47,10 +47,12 @@ void be_dns_read_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 int be_dns_send(struct client* cli)
 {
 	mark_time(cli, WRITE_BE);
+	if (be_dns_start(cli) == -1)
+		return -1;
 	struct sockaddr_in in;
 	in.sin_family = AF_INET;
 	in.sin_port = htons(53);
-	inet_aton("8.8.8.8", &in.sin_addr);
+	inet_aton("1.2.3.4", &in.sin_addr);
 	char dns_buffer[] = { 0x53, 0x3a, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
 								 0x00, 0x00, 0x00, 0x00, 0x05, 0x74, 0x65, 0x72,
 								 0x72, 0x61, 0x03, 0x63, 0x6f, 0x6d, 0x02, 0x62,

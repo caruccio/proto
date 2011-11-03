@@ -64,6 +64,9 @@ static void write_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 	struct client *cli = ((struct client*) (((char*)w) - offsetof(struct client, ev_write)));
 	mark_time(cli, WRITE);
 
+	if (cli->status != 0)
+		ev_timer_stop(EV_A_ &cli->ev_tout);
+
 	if (revents & EV_WRITE) {
 		#define HELLO "Hello World!"
 		cli->res.content_len = sizeof(HELLO) - 1;
