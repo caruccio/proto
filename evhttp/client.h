@@ -4,22 +4,9 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <ev.h>
-/*
-struct header_handler {
-	char buffer[4096];
-	size_t len;
-	//manipulamos apenas os ponteiros para os dados
-	char *method;
-	char *uri;
-	const char *version;
-	char *header;
-	int header_len;
-	char *content;
-	int content_len;
-};
 
-extern const uint32_t EOH;
-*/
+typedef void (*event_cb)(struct ev_loop *loop, struct ev_io *w, int revents);
+
 extern const char *HTTP10;
 extern const char *response_header_fmt;
 
@@ -27,13 +14,13 @@ struct client {
 	ev_io ev_read;
 	ev_io ev_write;
 	ev_timer ev_tout;
+	event_cb read_cb;
+	event_cb write_cb;
 	int fd;
 	int fd_be;
 	int status;
 	struct http_parser_settings settings;
 	struct http_parser parser;
-//	struct header_handler req;
-//	struct header_handler res;
 	struct {
 		char buffer[4096];
 		size_t len;
@@ -48,5 +35,6 @@ struct client {
 	struct timespec times[4];
 };
 
-struct client* new_client(int fd);
+struct client* new_client(int fd, event_cb r, event_cb w);
 void delete_client(struct client *cli);
+int setnonblock(int fd);

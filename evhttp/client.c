@@ -5,18 +5,21 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <fcntl.h>
 
 const char *HTTP10 = "HTTP/1.0";
 //const uint32_t EOH = 0x0a0d0a0d; //\r\n\r\n
 const char *response_header_fmt = "%s %u %s\r\nContent-Length: %i\r\nConnection: close\r\nContent-Type: %s\r\n\r\n";
 
-struct client* new_client(int fd)
+struct client* new_client(int fd, event_cb r, event_cb w)
 {
 	struct client *cli = calloc(1, sizeof(*cli));
 
 	cli->fd = fd;
 	cli->fd_be = -1;
 	cli->status = 0;
+	cli->read_cb = r;
+	cli->write_cb = w;
 
 	cli->req.buffer[0] = '\0';
 	cli->req.len = 0;
@@ -60,4 +63,16 @@ void delete_client(struct client *cli)
 	//printf("- %lu.%09lu %lu.%09lu\n", cli->times[READ].tv_sec, cli->times[READ].tv_nsec, cli->times[WRITE].tv_sec, cli->times[WRITE].tv_nsec);
 }
 
+int setnonblock(int fd)
+{
+	int flags;
 
+	flags = fcntl(fd, F_GETFL);
+	if (flags < 0)
+		return flags;
+	flags |= O_NONBLOCK;
+	if (fcntl(fd, F_SETFL, flags) < 0)
+		return -1;
+
+	return 0;
+}

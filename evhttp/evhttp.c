@@ -39,7 +39,6 @@ http://software.schmorp.de/pkg/libev.html
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h> 
-#include <fcntl.h>
 #include <errno.h>
 #include <err.h>
 #include <stddef.h>
@@ -49,7 +48,8 @@ http://software.schmorp.de/pkg/libev.html
 #include <alloca.h>
 #include "client.h"
 #include "timer.h"
-#include "http_parser.h"
+#include "http.h"
+#include "be_dns.h"
 
 ev_io ev_accept;
 static int SERVER_PORT = 3077;
@@ -93,164 +93,25 @@ static void write_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 	//TODO: controle de buffer
 }
 
-static void read_be_cb(struct ev_loop *loop, struct ev_io *w, int revents)
-{
-	struct client *cli = ((struct client*) (((char*)w) - offsetof(struct client, ev_read)));
-	ev_timer_stop(EV_A_ &cli->ev_tout);
-	mark_time(cli, READ_BE);
-	char dns_buffer[4096];
-	int ret = recv(cli->fd_be, dns_buffer, sizeof(dns_buffer), 0);
-
-	if (ret <= 0) {
-		ev_io_stop(EV_A_ w);
-		delete_client(cli);
-		return;
-	}
-
-//	printf("recv: %i\n", ret);
-	if (ret > 0) {
-		cli->status = 200;
-	} else {
-		cli->status = 404;
-	}
-
-	ev_io_stop(EV_A_ w);
-	ev_io_init(&cli->ev_write, write_cb, cli->fd, EV_WRITE);
-	ev_io_start(loop, &cli->ev_write);
-}
-
-static int send_be(struct client* cli)
-{
-	mark_time(cli, WRITE_BE);
-	struct sockaddr_in in;
-	in.sin_family = AF_INET;
-	in.sin_port = htons(53);
-	inet_aton("8.8.8.8", &in.sin_addr);
-	char dns_buffer[] = { 0x53, 0x3a, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
-								 0x00, 0x00, 0x00, 0x00, 0x05, 0x74, 0x65, 0x72,
-								 0x72, 0x61, 0x03, 0x63, 0x6f, 0x6d, 0x02, 0x62,
-								 0x72, 0x00, 0x00, 0x01, 0x00, 0x01
-	};
-
-	const int ret = sendto(cli->fd_be, dns_buffer, sizeof(dns_buffer), 0, (struct sockaddr *)&in, sizeof(in));
-	return ret == sizeof(dns_buffer) ? 0 : -1;
-}
-
-static void write_be_cb(struct ev_loop *loop, struct ev_io *w, int revents)
-{
-	struct client *cli = ((struct client*) (((char*)w) - offsetof(struct client, ev_write)));
-
-	ev_io_stop(EV_A_ w);
-	if (send_be(cli) == 0) {
-		ev_io_init(&cli->ev_read, read_be_cb, cli->fd_be, EV_READ);
-		ev_io_start(loop, &cli->ev_read);
-	} else {
-		cli->status = 500;
-		ev_io_init(&cli->ev_write, write_cb, cli->fd, EV_WRITE);
-		ev_io_start(loop, &cli->ev_write);
-	}
-}
-
-static int setnonblock(int fd)
-{
-	int flags;
-
-	flags = fcntl(fd, F_GETFL);
-	if (flags < 0)
-		return flags;
-	flags |= O_NONBLOCK;
-	if (fcntl(fd, F_SETFL, flags) < 0)
-		return -1;
-
-	return 0;
-}
-
-static int start_backend(struct client *cli)
-{
-	cli->fd_be = socket(AF_INET, SOCK_DGRAM, 0);
-	if (cli->fd_be == -1)
-		return -1;
-
-	if (setnonblock(cli->fd_be) < 0)
-		return -1;
-
-	return 1;
-}
-
-static int on_message_begin_cb(http_parser* parser)
-{
-	//printf("%s\n", __FUNCTION__);
-	return 0;
-}
-
-static int on_url_cb(http_parser* parser, const char *at, size_t length)
-{
-//	printf("%s %s [%s] %zu.\n", __FUNCTION__, http_method_str(parser->method), at, length);
-	return 0;
-}
-
-static int on_header_field_cb(http_parser* parser, const char *at, size_t length)
-{
-//	printf("%s HTTP/%hu.%hu [%s] %zu.\n", __FUNCTION__, parser->http_major, parser->http_minor, at, length);
-	return 0;
-}
-
-static int on_header_value_cb(http_parser* parser, const char *at, size_t length)
-{
-//	printf("%s [%s] %zu.\n", __FUNCTION__, at, length);
-	return 0;
-}
-
-static int on_headers_complete_cb(http_parser* parser)
-{
-//	printf("%s\n", __FUNCTION__);
-	return 0;
-}
-
-static int on_body_cb(http_parser* parser, const char *at, size_t length)
-{
-//	printf("%s [%s] %zu.\n", __FUNCTION__, at, length);
-	return 0;
-}
-
-static int on_message_complete_cb(http_parser* parser)
-{
-//	printf("%s\n", __FUNCTION__);
-	return 0;
-}
-
 static void read_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 {
 	struct client *cli = ((struct client*) (((char*)w) - offsetof(struct client, ev_read)));
-	const int ret = read(cli->fd, cli->req.buffer, sizeof(cli->req.buffer) - cli->req.len - 1);
+	cli->req.len = read(cli->fd, cli->req.buffer, sizeof(cli->req.buffer));
 
-	if (ret < 1) {
+	if (cli->req.len < 1 || parse_http(cli) == -1) {
 		goto err_500;
 	}
 
-	cli->settings.on_message_begin = on_message_begin_cb;
-	cli->settings.on_url = on_url_cb;
-	cli->settings.on_header_field = on_header_field_cb;
-	cli->settings.on_header_value = on_header_value_cb;
-	cli->settings.on_headers_complete = on_headers_complete_cb;
-	cli->settings.on_body = on_body_cb;
-	cli->settings.on_message_complete = on_message_complete_cb;
-	http_parser_init(&cli->parser, HTTP_REQUEST);
-
-	if (http_parser_execute(&cli->parser, &cli->settings, cli->req.buffer, ret) != ret) {
-		goto err_500;
-	}
-
-	switch (start_backend(cli)) {
+	switch (be_dns_send(cli)) {
 		case 0:
 			ev_io_stop(EV_A_ w);
-			ev_io_init(&cli->ev_write, write_be_cb, cli->fd_be, EV_WRITE);
+			ev_io_init(&cli->ev_write, be_dns_write_cb, cli->fd_be, EV_WRITE);
 			ev_io_start(loop, &cli->ev_write);
 			return;
 		case 1:
 			ev_io_stop(EV_A_ w);
-			if (send_be(cli) == 0) {
-				ev_io_init(&cli->ev_read, read_be_cb, cli->fd_be, EV_READ);
+			if (be_dns_send(cli) == 0) {
+				ev_io_init(&cli->ev_read, be_dns_read_cb, cli->fd_be, EV_READ);
 				ev_io_start(loop, &cli->ev_read);
 			} else {
 				cli->status = 500;
@@ -290,7 +151,7 @@ static void accept_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 		return;
 	}
 
-	cli = new_client(client_fd);
+	cli = new_client(client_fd, read_cb, write_cb);
 	mark_time(cli, READ);
 
 	if (setnonblock(cli->fd) < 0)
