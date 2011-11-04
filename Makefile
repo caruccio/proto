@@ -21,6 +21,5 @@ gdb: $(APP)
 strace: $(APP)
 	strace $(SOPT) $(SOPTS) $(SPARM) $(SPARMS) $(RUN)
 
-clean:
-	rm -f $(APP) $(OBJS)
-
+clean: clean-$(APP)
+	rm -f $(APP) *.o
